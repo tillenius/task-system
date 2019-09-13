@@ -7,67 +7,158 @@
 #include <unordered_map>
 #include <condition_variable>
 
-struct task;
+struct Task;
+struct TaskQueue;
+class TaskSystem;
 
-struct handle {
+struct Handle {
 	std::atomic<int> version{ 0 };
-	int next_read = 0;
-	int next_write = 0;
-	int queueIndex = 0;
-	std::vector<task *> queue;
+	std::atomic<int64_t> next{ 0 };
 	std::mutex mutex;
+	std::vector<Task *> queue;
+	int queueIndex = 0;
 
 	int schedule_read();
 	int schedule_write();
 	void release() { ++version; }
-	void enqueue(task * task);
-	void enqueue_unsafe(task * task);
-	task * dequeue();
+	void enqueue(Task * task);
+	Task * dequeue();
 };
 
-struct dependency {
-	handle * h;
+struct Dependency {
+	Handle * handle;
 	int version;
-	dependency(handle * h, int version) : h(h), version(version) {}
+	Dependency(Handle * handle, int version) : handle(handle), version(version) {}
 };
 
-struct TaskQueue;
+struct Context {
+	TaskSystem * task_system;
+	Task * current_task;
 
-struct task {
-	std::vector<dependency> dependencies;
-	std::function<void()> fn;
+	Context(TaskSystem * task_system, Task * current_task) : task_system(task_system), current_task(current_task) {}
+};
+
+struct Task {
+	std::vector<Dependency> dependencies;
+	std::function<void(Context)> fn;
 	TaskQueue * queue = nullptr;
 };
 
-inline int handle::schedule_read() {
-	++next_write;
-	return next_read;
+struct TaskQueue {
+	std::vector< Task * > tasks;
+	std::mutex mutex;
+	std::condition_variable condVar;
+	std::atomic<int> executed = 0;
+	std::atomic<int> added = 0;
+	TaskSystem & task_system;
+	int next = 0;
+
+	TaskQueue(TaskSystem & task_system) : task_system(task_system) {}
+
+	void enqueue(Task * t);
+	bool wait();
+	Task * fetch();
+	Task * run_task(Task * t, bool get_successor);
+};
+
+struct TaskHandleMap {
+	std::mutex mutex;
+	std::unordered_map< void *, Handle *> handle_map;
+
+	~TaskHandleMap() {
+		for (auto & it : handle_map) {
+			delete it.second;
+		}
+		handle_map.clear();
+	}
+
+	Handle * get(void * ptr) {
+		std::lock_guard<std::mutex> guard(mutex);
+		Handle *& h = handle_map[ptr];
+		if (h == nullptr) {
+			h = new Handle();
+		}
+		return h;
+	}
+
+};
+
+class TaskSystem {
+public:
+	TaskSystem() : main(*this), shared(*this) {}
+
+	void submit(TaskQueue & queue, Task * task);
+	void submit(TaskQueue & queue, std::function<void(Context)> fn);
+	void submit(TaskQueue & queue, std::initializer_list<void *> inputList, std::initializer_list<void *> outputList, std::function<void(Context)> fn);
+	void submit(TaskQueue & queue, std::initializer_list<Handle *> inputList, std::initializer_list<Handle *> outputList, std::function<void(Context)> fn);
+	void run(int num_workers);
+
+	TaskQueue main;
+	TaskQueue shared;
+	TaskHandleMap handle_map;
+};
+
+class SplitTask {
+public:
+	SplitTask(Context c) : task_system(*c.task_system) {
+		handle = new Handle();
+		join_task = new Task();
+		std::swap(join_task->dependencies, c.current_task->dependencies);
+		join_task->fn = [](Context c) {
+			// the last handle of join_task is the join handle.
+			// delete it and remove from the dependencies list so it won't get accessed after this task is finished.
+			delete c.current_task->dependencies.back().handle;
+			c.current_task->dependencies.pop_back();
+		};
+	}
+
+	~SplitTask() {
+		join_task->dependencies.push_back(Dependency(handle,handle->schedule_write()));
+		task_system.submit(task_system.shared, join_task);
+	}
+
+	void subtask(TaskQueue & queue, std::function<void(Context)> fn);
+	void subtask(TaskQueue & queue, std::initializer_list<void *> inputList, std::initializer_list<void *> outputList, std::function<void(Context)> fn);
+	void subtask(TaskQueue & queue, std::initializer_list<Handle *> inputList, std::initializer_list<Handle *> outputList, std::function<void(Context)> fn);
+
+private:
+	Task * join_task;
+	Handle * handle;
+	TaskSystem & task_system;
+};
+
+inline int Handle::schedule_read() {
+	int64_t was = next.fetch_add(0x0000000100000000);
+	return was & 0xffffffff;
 }
 
-inline int handle::schedule_write() {
-	const int next = next_write;
-	++next_write;
-	next_read = next_write;
-	return next;
+inline int Handle::schedule_write() {
+	for (;;) {
+		int64_t was = next.load();
+		int64_t newValue = was;
+		newValue &= 0xffffffff00000000;
+		newValue += 0x0000000100000000;
+		newValue |= newValue >> 32;
+
+		if (next.compare_exchange_weak(was, newValue)) {
+			return (was >> 32) & 0xffffffff;
+		}
+	}
 }
 
-inline void handle::enqueue(task * task) {
+inline void Handle::enqueue(Task * task) {
 	std::lock_guard<std::mutex> guard(mutex);
-	enqueue_unsafe(task);
-}
-
-inline void handle::enqueue_unsafe(task * task) {
 	queue.push_back(task);
 }
 
-inline task * handle::dequeue() {
+inline Task * Handle::dequeue() {
 	std::lock_guard<std::mutex> guard(mutex);
 	if (queueIndex >= queue.size()) {
 		return nullptr;
 	}
-	task * t = queue[queueIndex];
+	Task * t = queue[queueIndex];
 	for (int i = 0; i < t->dependencies.size(); ++i) {
-		if (t->dependencies[i].h == this) {
+		if (t->dependencies[i].handle == this) {
 			if (t->dependencies[i].version > version.load()) {
 				return nullptr;
 			}
@@ -79,152 +170,251 @@ inline task * handle::dequeue() {
 	exit(0);
 }
 
-struct TaskQueue {
-	std::vector< task * > tasks;
-	std::mutex mutex;
-	std::condition_variable condVar;
-	std::atomic<int> next = 0;
-	std::atomic<int> executed = 0;
-	int added = 0;
-
-	void enqueue(task * t) {
-		{
-			std::lock_guard<std::mutex> guard(mutex);
-			tasks.push_back(t);
-		}
-		condVar.notify_one();
-	}
-
-	void enqueue_unsafe(task * t) {
+inline void TaskQueue::enqueue(Task * t) {
+	{
+		std::lock_guard<std::mutex> guard(mutex);
 		tasks.push_back(t);
 	}
+	condVar.notify_one();
+}
 
-	bool wait_for_done() {
-		if (added == executed.load()) {
-			return true;
-		}
-		std::unique_lock<std::mutex> guard(mutex);
-		condVar.wait(guard);
-		return added == executed.load();
+inline bool TaskQueue::wait() {
+	if (added == executed.load()) {
+		return true;
 	}
+	std::unique_lock<std::mutex> guard(mutex);
+	condVar.wait(guard);
+	return added == executed.load();
+}
 
-	task * fetch() {
-		std::lock_guard<std::mutex> guard(mutex);
-		if (next.load() >= tasks.size()) {
-			tasks.clear();
-			next = 0;
-			return nullptr;
-		}
-		return tasks[next++];
+inline Task * TaskQueue::fetch() {
+	std::lock_guard<std::mutex> guard(mutex);
+	if (next >= tasks.size()) {
+		tasks.clear();
+		next = 0;
+		return nullptr;
 	}
-};
+	return tasks[next++];
+}
 
-struct TaskHandleMap {
-	std::unordered_map< void *, handle *> handle_map;
+inline Task * TaskQueue::run_task(Task * t, bool get_successor) {
+	t->fn(Context(&task_system, t));
 
-	~TaskHandleMap() {
-		for (auto & it : handle_map) {
-			delete it.second;
-		}
-		handle_map.clear();
-	}
+	Task * first_successor = nullptr;
+	for (Dependency & d : t->dependencies) {
+		d.handle->release();
+		Task * successor = d.handle->dequeue();
+		if (successor != nullptr) {
 
-	handle * get(void * ptr) {
-		handle *& h = handle_map[ptr];
-		if (h == nullptr) {
-			h = new handle();
-		}
-		return h;
-	}
-
-};
-
-struct TaskSystem {
-
-	TaskQueue main;
-	TaskQueue shared;
-	TaskHandleMap handle_map;
-
-	void submit(TaskQueue & queue, std::initializer_list<void *> inputList, std::initializer_list<void *> outputList, std::function<void()> fn) {
-		task * t = new task();
-		t->fn = fn;
-		t->queue = &queue;
-		handle * wait_for = nullptr;
-		for (void * ptr : inputList) {
-			handle * h = handle_map.get(ptr);	// not thread safe
-			const int curr = h->version.load();
-			const int required = h->schedule_read();
-			t->dependencies.push_back(dependency(h, required));
-			if (wait_for == nullptr && curr < required) {
-				wait_for = h;
+			TaskQueue * target_queue = successor->queue == nullptr ? this : successor->queue;
+			if (get_successor && first_successor == nullptr && target_queue == this) {
+				first_successor = successor;
+			}
+			else {
+				target_queue->enqueue(successor);
 			}
 		}
-		for (void * ptr : outputList) {
-			handle * h = handle_map.get(ptr);
-			const int curr = h->version.load();
-			const int required = h->schedule_write();
-			t->dependencies.push_back(dependency(h, required));
-			if (wait_for == nullptr && curr < required) {
-				wait_for = h;
-			}
-		}
-		if (wait_for == nullptr) {
-			queue.enqueue_unsafe(t);
-		}
-		else {
-			wait_for->enqueue_unsafe(t);
-		}
-		++queue.added;
-	}
-};
-
-
-struct TaskExecutor {
-	TaskQueue & queue;
-
-	TaskExecutor(TaskQueue & queue) : queue(queue) {}
-
-	task * run_task(task * t) {
-		t->fn();
-
-		task * first_successor = nullptr;
-		for (dependency & d : t->dependencies) {
-			d.h->release();
-			task * successor = d.h->dequeue();
-			if (successor != nullptr) {
-
-				TaskQueue * target_queue = successor->queue;
-				if (target_queue == nullptr) {
-					target_queue = &queue;
-				}
-
-				if (first_successor == nullptr && target_queue == &queue) {
-					first_successor = successor;
-				}
-				else {
-					target_queue->enqueue(successor);
-				}
-			}
-		}
-
-		if (++queue.executed == queue.added) {
-			queue.condVar.notify_all();
-		}
-
-		delete t;
-		return first_successor;
 	}
 
-	void run_until_done() {
-		do {
-			task * t = queue.fetch();
-
-			while (t != nullptr) {
-				t = run_task(t);
-				if (t == nullptr) {
-					t = queue.fetch();
-				}
-			}
-		} while (!queue.wait_for_done());
+	if (++executed == added) {
+		condVar.notify_all();
 	}
-};
+
+	delete t;
+	return first_successor;
+}
+
+inline void TaskSystem::submit(TaskQueue & queue, Task * t) {
+	++queue.added;
+	for (Dependency & dep : t->dependencies) {
+		if (dep.version > dep.handle->version.load()) {
+			dep.handle->enqueue(t);
+			return;
+		}
+	}
+	queue.enqueue(t);
+}
+
+inline void TaskSystem::submit(TaskQueue & queue, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	queue.enqueue(t);
+}
+
+inline void TaskSystem::submit(TaskQueue & queue, std::initializer_list<void *> inputList, std::initializer_list<void *> outputList, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	Handle * wait_for = nullptr;
+	for (void * ptr : inputList) {
+		Handle * h = handle_map.get(ptr);
+		const int curr = h->version.load();
+		const int required = h->schedule_read();
+		t->dependencies.push_back(Dependency(h, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = h;
+		}
+	}
+	for (void * ptr : outputList) {
+		Handle * h = handle_map.get(ptr);
+		const int curr = h->version.load();
+		const int required = h->schedule_write();
+		t->dependencies.push_back(Dependency(h, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = h;
+		}
+	}
+	if (wait_for == nullptr) {
+		queue.enqueue(t);
+	}
+	else {
+		wait_for->enqueue(t);
+	}
+}
+
+inline void TaskSystem::submit(TaskQueue & queue, std::initializer_list<Handle *> inputList, std::initializer_list<Handle *> outputList, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	Handle * wait_for = nullptr;
+	for (Handle * handle : inputList) {
+		const int curr = handle->version.load();
+		const int required = handle->schedule_read();
+		t->dependencies.push_back(Dependency(handle, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = handle;
+		}
+	}
+	for (Handle * handle : outputList) {
+		const int curr = handle->version.load();
+		const int required = handle->schedule_write();
+		t->dependencies.push_back(Dependency(handle, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = handle;
+		}
+	}
+	if (wait_for == nullptr) {
+		queue.enqueue(t);
+	}
+	else {
+		wait_for->enqueue(t);
+	}
+}
+
+inline void SplitTask::subtask(TaskQueue & queue, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	t->dependencies.push_back(Dependency(handle, handle->schedule_read()));
+	queue.enqueue(t);
+}
+
+inline void SplitTask::subtask(TaskQueue & queue, std::initializer_list<void *> inputList, std::initializer_list<void *> outputList, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	t->dependencies.push_back(Dependency(handle, handle->schedule_read()));
+	Handle * wait_for = nullptr;
+	for (void * ptr : inputList) {
+		Handle * h = task_system.handle_map.get(ptr);
+		const int curr = h->version.load();
+		const int required = h->schedule_read();
+		t->dependencies.push_back(Dependency(h, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = h;
+		}
+	}
+	for (void * ptr : outputList) {
+		Handle * h = task_system.handle_map.get(ptr);
+		const int curr = h->version.load();
+		const int required = h->schedule_write();
+		t->dependencies.push_back(Dependency(h, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = h;
+		}
+	}
+	if (wait_for == nullptr) {
+		queue.enqueue(t);
+	}
+	else {
+		wait_for->enqueue(t);
+	}
+}
+
+inline void SplitTask::subtask(TaskQueue & queue, std::initializer_list<Handle *> inputList, std::initializer_list<Handle *> outputList, std::function<void(Context)> fn) {
+	++queue.added;
+	Task * t = new Task();
+	t->fn = fn;
+	t->queue = &queue;
+	t->dependencies.push_back(Dependency(handle, handle->schedule_read()));
+	Handle * wait_for = nullptr;
+	for (Handle * handle : inputList) {
+		const int curr = handle->version.load();
+		const int required = handle->schedule_read();
+		t->dependencies.push_back(Dependency(handle, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = handle;
+		}
+	}
+	for (Handle * handle : outputList) {
+		const int curr = handle->version.load();
+		const int required = handle->schedule_write();
+		t->dependencies.push_back(Dependency(handle, required));
+		if (wait_for == nullptr && curr < required) {
+			wait_for = handle;
+		}
+	}
+	if (wait_for == nullptr) {
+		queue.enqueue(t);
+	}
+	else {
+		wait_for->enqueue(t);
+	}
+}
+
+inline void TaskSystem::run(int num_workers) {
+	// worker threads. runs only tasks from the ts.shared queue
+	std::vector<std::thread> workers;
+	for (int i = 0; i < num_workers; ++i) {
+		workers.push_back(std::thread([this] {
+			do {
+				Task * t = shared.fetch();
+				while (t != nullptr) {
+					t = shared.run_task(t, true);
+					if (t == nullptr) {
+						t = shared.fetch();
+					}
+				}
+			} while (!shared.wait() || !main.wait());
+		}));
+	}
+
+	// main thread.
+
+	do {
+		Task * t = main.fetch();
+		while (t != nullptr) {
+			t = main.run_task(t, true);
+			if (t == nullptr) {
+				t = main.fetch();
+			}
+		}
+
+		t = shared.fetch();
+		if (t != nullptr) {
+			shared.run_task(t, false);
+			continue;
+		}
+	} while (!main.wait() || !shared.wait());
+
+	// wait for all threads to finish
+	for (int i = 0; i < workers.size(); ++i) {
+		workers[i].join();
+	}
+}

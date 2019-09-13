@@ -1,44 +1,50 @@
 #include "TaskSystem.h"
 #include <iostream>
+#include <chrono>
 
 int main() {
 
 	TaskSystem ts;
 
-	// submit tasks (must be done in serial before any task is executed)
+	const int numBlocks = 10;
 
-	int a = 2;
-	int b = 3;
-	int c = 0;
-	int d = 0;
-	// read a and b, write to c
-	ts.submit(ts.shared, { &a, &b }, { &c }, [&a, &b, &c]() { c = a + b; std::cout << std::this_thread::get_id() << " c=" << c << std::endl; });
-	// read a and b, write to d
-	ts.submit(ts.shared, { &a, &b }, { &d }, [&a, &b, &d]() { d = a + b; std::cout << std::this_thread::get_id() << " d=" << d << std::endl; });
-	// submit to the 'main thread' queue
-	ts.submit(ts.main, { &c, &d }, { &a }, [&a, &c, &d]() { a = c + d; std::cout << std::this_thread::get_id() << " a=" << a << std::endl; });
+	std::vector<Handle> h(numBlocks * numBlocks);
 
-	ts.submit(ts.shared, { &a, &b }, { &d }, [&a, &b, &d]() { d = a + b; std::cout << std::this_thread::get_id() << " d=" << d << std::endl; });
-	ts.submit(ts.shared, { &a, &c }, { &d }, [&a, &c, &d]() { d += a + c; std::cout << std::this_thread::get_id() << " d=" << d << std::endl; });
+	for (size_t j = 0; j < numBlocks; j++) {
+		for (size_t k = 0; k < j; k++) {
+			for (size_t i = j + 1; i < numBlocks; i++) {
+				// A[i,j] = A[i,j] - A[i,k] * (A[j,k])^t
+				ts.submit(ts.shared, {&h[i * numBlocks + k], &h[j * numBlocks + k]}, {&h[i * numBlocks + j]}, [i, j, k](Context) {
+					std::cout << std::this_thread::get_id() << " gemm " << i << "," << j << "," << k << std::endl;
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				});
+			}
+		}
+		for (size_t i = 0; i < j; i++) {
+			// A[j,j] = A[j,j] - A[j,i] * (A[j,i])^t
+			ts.submit(ts.shared, {&h[j * numBlocks + i] }, {&h[j * numBlocks + j]}, [i, j](Context) {
+				std::cout << std::this_thread::get_id() << " syrk " << i << "," << j << std::endl;
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			});
+		}
 
-	// worker threads. runs only tasks from the ts.shared queue
-	std::vector< std::thread > workers;
-	for (int i = 0; i < 4; ++i) {
-		workers.push_back(std::thread([&ts] {
-			TaskExecutor te(ts.shared);
-			te.run_until_done();
-		}));
+		// Cholesky Factorization of A[j,j]. Constrain to main thread, for demonstrating.
+		ts.submit(ts.main, {}, {&h[j * numBlocks + j]}, [j](Context) {
+			std::cout << std::this_thread::get_id() << " potrf " << j << std::endl;
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		});
+
+		for (size_t i = j + 1; i < numBlocks; i++) {
+			// A[i,j] <- A[i,j] = X * (A[j,j])^t
+			ts.submit(ts.shared, {&h[j * numBlocks + j]}, {&h[i * numBlocks + j]}, [i, j](Context) {
+				std::cout << std::this_thread::get_id() << " trsm " << i << "," << j << std::endl;
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			});
+		}
 	}
 
-	// main thread. runs only tasks from the ts.main queue
-	TaskExecutor mainThread(ts.main);
-	mainThread.run_until_done();
+	const int num_workers = 4;
+	ts.run(num_workers);
 
-	// wait for all threads to finish
-	for (int i = 0; i < workers.size(); ++i) {
-		workers[i].join();
-	}
-
-	std::cout << std::this_thread::get_id() << " " << a << " " << b << " " << c << " " << d << std::endl;
 	return 0;
 }
